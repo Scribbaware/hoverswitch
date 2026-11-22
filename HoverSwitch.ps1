@@ -4,6 +4,7 @@
 #   OFF: active window tracking off + your normal delay restored
 # Auto-click (F8 by default, or the tray menu): left-clicks where the mouse is every 2 minutes,
 #   but only while a WoW window (Wow*.exe, e.g. WowClassic.exe / Wow.exe) is in the foreground.
+#   A few seconds after each click it presses Enter (to close the "faction unavailable" dialog).
 #   Made for retrying "Finish" on character creation when a realm is full.
 # Settings are kept in %APPDATA%\HoverSwitch\settings.json
 
@@ -46,6 +47,9 @@ public static class HoverNative {
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
     const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     const uint MOUSEEVENTF_LEFTUP   = 0x0004;
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    [DllImport("user32.dll")] static extern uint MapVirtualKey(uint code, uint mapType);
+    const uint KEYEVENTF_KEYUP = 0x0002;
 
     // Process id of the window in the foreground (0 if none).
     public static int ForegroundPid() {
@@ -59,6 +63,13 @@ public static class HoverNative {
         mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
         System.Threading.Thread.Sleep(60);
         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+    }
+    // One Enter key press.
+    public static void PressEnter() {
+        byte scan = (byte)MapVirtualKey(0x0D, 0);
+        keybd_event(0x0D, scan, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(60);
+        keybd_event(0x0D, scan, KEYEVENTF_KEYUP, UIntPtr.Zero);
     }
 
     public static int GetDelay() { int v = 0; SpiGet(SPI_GETACTIVEWNDTRKTIMEOUT, 0, ref v, 0); return v; }
@@ -114,6 +125,7 @@ $defaults = [ordered]@{
     Hotkey      = 'Ctrl+Alt+H'
     ClickHotkey   = 'F8'   # starts/stops auto-click
     ClickInterval = 120    # seconds between auto-clicks
+    EnterDelay    = 3      # seconds after each click to press Enter (0 = no Enter)
 }
 $cfg = [ordered]@{}
 foreach ($k in $defaults.Keys) { $cfg[$k] = $defaults[$k] }
@@ -209,6 +221,7 @@ function Register-ClickHotkey { Register-Key $clickHotkey $cfg.ClickHotkey }
 # window is in front. If WoW is not in front when a click is due, the click waits until it is.
 $script:clickerOn = $false
 $script:nextClick = [DateTime]::MinValue
+$script:pendingEnter = $null   # time to press Enter after the last click
 $script:clickCount = 0
 $script:wowInFront = $false
 
@@ -223,12 +236,14 @@ function Set-Clicker([bool]$on) {
     $script:clickerOn = $on
     if ($on) {
         $script:clickCount = 0
+        $script:pendingEnter = $null
         $script:nextClick = [DateTime]::Now   # first click right away (as soon as WoW is in front)
         $clickTimer.Start()
         Invoke-ClickerTick
-        $tray.ShowBalloonTip(2500, 'HoverSwitch', "Auto-click ON: clicks every $(Format-Interval) while WoW is in front. $($cfg.ClickHotkey) to stop.", 'Info')
+        $tray.ShowBalloonTip(2500, 'HoverSwitch', "Auto-click ON: clicks (then Enter) every $(Format-Interval) while WoW is in front. $($cfg.ClickHotkey) to stop.", 'Info')
     } else {
         $clickTimer.Stop()
+        $script:pendingEnter = $null
         $tray.ShowBalloonTip(2000, 'HoverSwitch', "Auto-click OFF ($script:clickCount clicks).", 'Info')
     }
     Update-UI
@@ -243,10 +258,17 @@ function Format-Interval {
 function Invoke-ClickerTick {
     if (-not $script:clickerOn) { return }
     $script:wowInFront = Test-WowInFront
-    if ($script:wowInFront -and [DateTime]::Now -ge $script:nextClick) {
+    $now = [DateTime]::Now
+    if ($null -ne $script:pendingEnter -and $now -ge $script:pendingEnter) {
+        # Close the "faction unavailable" dialog. Skipped if WoW is no longer in front.
+        if ($script:wowInFront) { [HoverNative]::PressEnter() }
+        $script:pendingEnter = $null
+    }
+    if ($script:wowInFront -and $null -eq $script:pendingEnter -and $now -ge $script:nextClick) {
         [HoverNative]::LeftClick()
         $script:clickCount++
-        $script:nextClick = [DateTime]::Now.AddSeconds([Math]::Max(5, [int]$cfg.ClickInterval))
+        $script:nextClick = $now.AddSeconds([Math]::Max(5, [int]$cfg.ClickInterval))
+        if ([int]$cfg.EnterDelay -gt 0) { $script:pendingEnter = $now.AddSeconds([int]$cfg.EnterDelay) }
     }
     Update-UI
 }
@@ -270,7 +292,7 @@ $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
 $form.StartPosition = 'CenterScreen'
-$form.ClientSize = New-Object System.Drawing.Size 300, 365
+$form.ClientSize = New-Object System.Drawing.Size 300, 397
 $form.Icon = $iconOn
 $form.Font = New-Object System.Drawing.Font 'Segoe UI', 9
 
@@ -344,24 +366,35 @@ $numInterval.Minimum = 5; $numInterval.Maximum = 3600; $numInterval.Increment = 
 $numInterval.Value = [decimal][Math]::Max(5, [int]$cfg.ClickInterval)
 $form.Controls.Add($numInterval)
 
+$lblEnter = New-Object System.Windows.Forms.Label
+$lblEnter.Text = 'Then press Enter after (s, 0=off):'
+$lblEnter.SetBounds(15, 302, 185, 20)
+$form.Controls.Add($lblEnter)
+
+$numEnter = New-Object System.Windows.Forms.NumericUpDown
+$numEnter.SetBounds(200, 300, 85, 24)
+$numEnter.Minimum = 0; $numEnter.Maximum = 60
+$numEnter.Value = [decimal][Math]::Min(60, [Math]::Max(0, [int]$cfg.EnterDelay))
+$form.Controls.Add($numEnter)
+
 $lblClickKey = New-Object System.Windows.Forms.Label
 $lblClickKey.Text = 'Auto-click hotkey (e.g. F8):'
-$lblClickKey.SetBounds(15, 302, 180, 20)
+$lblClickKey.SetBounds(15, 334, 180, 20)
 $form.Controls.Add($lblClickKey)
 
 $txtClickKey = New-Object System.Windows.Forms.TextBox
-$txtClickKey.SetBounds(200, 299, 85, 24)
+$txtClickKey.SetBounds(200, 331, 85, 24)
 $txtClickKey.Text = $cfg.ClickHotkey
 $form.Controls.Add($txtClickKey)
 
 $btnApply = New-Object System.Windows.Forms.Button
 $btnApply.Text = 'Save'
-$btnApply.SetBounds(120, 327, 80, 28)
+$btnApply.SetBounds(120, 361, 80, 28)
 $form.Controls.Add($btnApply)
 
 $btnHide = New-Object System.Windows.Forms.Button
 $btnHide.Text = 'Hide'
-$btnHide.SetBounds(205, 327, 80, 28)
+$btnHide.SetBounds(205, 361, 80, 28)
 $btnHide.add_Click({ $form.Hide() })
 $form.Controls.Add($btnHide)
 
@@ -377,6 +410,7 @@ $btnApply.add_Click({
         Register-AppHotkey | Out-Null
     }
     $cfg.ClickInterval = [int]$numInterval.Value
+    $cfg.EnterDelay = [int]$numEnter.Value
     $oldClickKey = $cfg.ClickHotkey
     $cfg.ClickHotkey = $txtClickKey.Text.Trim()
     if (-not (Register-ClickHotkey)) {
@@ -478,6 +512,7 @@ function Show-Settings {
     $txtKey.Text = $cfg.Hotkey
     $numInterval.Value = [decimal][Math]::Max(5, [int]$cfg.ClickInterval)
     $txtClickKey.Text = $cfg.ClickHotkey
+    $numEnter.Value = [decimal][Math]::Min(60, [Math]::Max(0, [int]$cfg.EnterDelay))
     Update-UI
     $form.Show(); $form.WindowState = 'Normal'; $form.Activate()
 }
