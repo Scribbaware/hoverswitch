@@ -2,6 +2,9 @@
 # Tray app. Left-click the tray icon (or press the hotkey) to switch hover mode on/off.
 #   ON : active window tracking on + your hover delay (default 50 ms)
 #   OFF: active window tracking off + your normal delay restored
+# Auto-click (F8 by default, or the tray menu): left-clicks where the mouse is every 2 minutes,
+#   but only while a WoW window (Wow*.exe, e.g. WowClassic.exe / Wow.exe) is in the foreground.
+#   Made for retrying "Finish" on character creation when a realm is full.
 # Settings are kept in %APPDATA%\HoverSwitch\settings.json
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -36,6 +39,27 @@ public static class HoverNative {
     [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
     [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int cmd);
     public static void HideConsole() { IntPtr h = GetConsoleWindow(); if (h != IntPtr.Zero) ShowWindow(h, 0); }
+
+    // ----- auto-click helpers -----
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+    const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    const uint MOUSEEVENTF_LEFTUP   = 0x0004;
+
+    // Process id of the window in the foreground (0 if none).
+    public static int ForegroundPid() {
+        IntPtr h = GetForegroundWindow();
+        if (h == IntPtr.Zero) return 0;
+        uint pid; GetWindowThreadProcessId(h, out pid);
+        return (int)pid;
+    }
+    // One left click at the current mouse position.
+    public static void LeftClick() {
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(60);
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+    }
 
     public static int GetDelay() { int v = 0; SpiGet(SPI_GETACTIVEWNDTRKTIMEOUT, 0, ref v, 0); return v; }
     public static bool SetDelay(int ms) { return SpiSet(SPI_SETACTIVEWNDTRKTIMEOUT, 0, (IntPtr)ms, SAVE_AND_BROADCAST); }
@@ -88,6 +112,8 @@ $defaults = [ordered]@{
     NormalDelay = $null   # ms, restored when hover mode is OFF (captured on first run)
     RaiseWindow = $true   # also bring the hovered window to the front
     Hotkey      = 'Ctrl+Alt+H'
+    ClickHotkey   = 'F8'   # starts/stops auto-click
+    ClickInterval = 120    # seconds between auto-clicks
 }
 $cfg = [ordered]@{}
 foreach ($k in $defaults.Keys) { $cfg[$k] = $defaults[$k] }
@@ -106,7 +132,7 @@ function Save-Settings { $cfg | ConvertTo-Json | Set-Content -Path $settingsFile
 Save-Settings
 
 # ---------- icons ----------
-function New-StateIcon([bool]$on) {
+function New-StateIcon([bool]$on, [bool]$clicker = $false) {
     $bmp = New-Object System.Drawing.Bitmap 32, 32
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = 'AntiAlias'
@@ -119,11 +145,18 @@ function New-StateIcon([bool]$on) {
         (New-Object System.Drawing.Point 22, 25), (New-Object System.Drawing.Point 19, 19),
         (New-Object System.Drawing.Point 25, 19))
     $g.FillPolygon([System.Drawing.Brushes]::White, $pts)
+    if ($clicker) {
+        # orange badge with a white ring in the top-right corner = auto-click running
+        $g.FillEllipse([System.Drawing.Brushes]::White, 17, 0, 15, 15)
+        $g.FillEllipse((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 140, 0))), 19, 2, 11, 11)
+    }
     $g.Dispose()
     [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
 }
 $iconOn  = New-StateIcon $true
 $iconOff = New-StateIcon $false
+$iconOnClick  = New-StateIcon $true $true
+$iconOffClick = New-StateIcon $false $true
 
 # ---------- core ----------
 function Test-HoverOn { [HoverNative]::GetTracking() }
@@ -147,11 +180,14 @@ function Switch-Hover { Set-HoverMode (-not (Test-HoverOn)) }
 $hotkey = New-Object HoverHotkey
 $hotkey.add_Pressed({ Switch-Hover })
 
-function Register-AppHotkey {
-    $hotkey.Unregister()
-    if ([string]::IsNullOrWhiteSpace($cfg.Hotkey) -or $cfg.Hotkey -eq 'None') { return $true }
+$clickHotkey = New-Object HoverHotkey
+$clickHotkey.add_Pressed({ Switch-Clicker })
+
+function Register-Key($hk, [string]$text) {
+    $hk.Unregister()
+    if ([string]::IsNullOrWhiteSpace($text) -or $text -eq 'None') { return $true }
     $mods = 0; $vk = 0
-    foreach ($part in ($cfg.Hotkey -split '\+')) {
+    foreach ($part in ($text -split '\+')) {
         switch ($part.Trim().ToLower()) {
             'ctrl'  { $mods = $mods -bor 2 }
             'alt'   { $mods = $mods -bor 1 }
@@ -163,7 +199,68 @@ function Register-AppHotkey {
         }
     }
     if ($vk -eq 0) { return $false }
-    return $hotkey.Register([uint32]$mods, [uint32]$vk)
+    return $hk.Register([uint32]$mods, [uint32]$vk)
+}
+function Register-AppHotkey   { Register-Key $hotkey $cfg.Hotkey }
+function Register-ClickHotkey { Register-Key $clickHotkey $cfg.ClickHotkey }
+
+# ---------- auto-click ----------
+# While running: every ClickInterval seconds one left click at the mouse position, only when a WoW
+# window is in front. If WoW is not in front when a click is due, the click waits until it is.
+$script:clickerOn = $false
+$script:nextClick = [DateTime]::MinValue
+$script:clickCount = 0
+$script:wowInFront = $false
+
+function Test-WowInFront {
+    $procId = [HoverNative]::ForegroundPid()
+    if ($procId -le 0) { return $false }
+    $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    return ($null -ne $p -and $p.ProcessName -like 'Wow*')
+}
+
+function Set-Clicker([bool]$on) {
+    $script:clickerOn = $on
+    if ($on) {
+        $script:clickCount = 0
+        $script:nextClick = [DateTime]::Now   # first click right away (as soon as WoW is in front)
+        $clickTimer.Start()
+        Invoke-ClickerTick
+        $tray.ShowBalloonTip(2500, 'HoverSwitch', "Auto-click ON: clicks every $(Format-Interval) while WoW is in front. $($cfg.ClickHotkey) to stop.", 'Info')
+    } else {
+        $clickTimer.Stop()
+        $tray.ShowBalloonTip(2000, 'HoverSwitch', "Auto-click OFF ($script:clickCount clicks).", 'Info')
+    }
+    Update-UI
+}
+function Switch-Clicker { Set-Clicker (-not $script:clickerOn) }
+
+function Format-Interval {
+    $sec = [int]$cfg.ClickInterval
+    if ($sec % 60 -eq 0) { "$($sec / 60) min" } else { "$sec s" }
+}
+
+function Invoke-ClickerTick {
+    if (-not $script:clickerOn) { return }
+    $script:wowInFront = Test-WowInFront
+    if ($script:wowInFront -and [DateTime]::Now -ge $script:nextClick) {
+        [HoverNative]::LeftClick()
+        $script:clickCount++
+        $script:nextClick = [DateTime]::Now.AddSeconds([Math]::Max(5, [int]$cfg.ClickInterval))
+    }
+    Update-UI
+}
+
+$clickTimer = New-Object System.Windows.Forms.Timer
+$clickTimer.Interval = 1000
+$clickTimer.add_Tick({ Invoke-ClickerTick })
+
+function Get-ClickerStatus {
+    if (-not $script:clickerOn) { return 'OFF' }
+    if (-not $script:wowInFront) { return 'waiting for WoW' }
+    $left = [int][Math]::Ceiling(($script:nextClick - [DateTime]::Now).TotalSeconds)
+    if ($left -lt 0) { $left = 0 }
+    return ('next in {0}:{1:00}' -f [int][Math]::Floor($left / 60), ($left % 60))
 }
 
 # ---------- settings window ----------
@@ -173,7 +270,7 @@ $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
 $form.StartPosition = 'CenterScreen'
-$form.ClientSize = New-Object System.Drawing.Size 300, 250
+$form.ClientSize = New-Object System.Drawing.Size 300, 365
 $form.Icon = $iconOn
 $form.Font = New-Object System.Drawing.Font 'Segoe UI', 9
 
@@ -223,14 +320,48 @@ $txtKey.SetBounds(200, 173, 85, 24)
 $txtKey.Text = $cfg.Hotkey
 $form.Controls.Add($txtKey)
 
+$sep = New-Object System.Windows.Forms.Label
+$sep.BorderStyle = 'Fixed3D'
+$sep.SetBounds(15, 207, 270, 2)
+$form.Controls.Add($sep)
+
+$btnClicker = New-Object System.Windows.Forms.Button
+$btnClicker.SetBounds(15, 218, 270, 40)
+$btnClicker.Font = New-Object System.Drawing.Font 'Segoe UI', 10, ([System.Drawing.FontStyle]::Bold)
+$btnClicker.FlatStyle = 'Flat'
+$btnClicker.ForeColor = [System.Drawing.Color]::White
+$btnClicker.add_Click({ Switch-Clicker })
+$form.Controls.Add($btnClicker)
+
+$lblInterval = New-Object System.Windows.Forms.Label
+$lblInterval.Text = 'Auto-click every (seconds):'
+$lblInterval.SetBounds(15, 270, 180, 20)
+$form.Controls.Add($lblInterval)
+
+$numInterval = New-Object System.Windows.Forms.NumericUpDown
+$numInterval.SetBounds(200, 268, 85, 24)
+$numInterval.Minimum = 5; $numInterval.Maximum = 3600; $numInterval.Increment = 10
+$numInterval.Value = [decimal][Math]::Max(5, [int]$cfg.ClickInterval)
+$form.Controls.Add($numInterval)
+
+$lblClickKey = New-Object System.Windows.Forms.Label
+$lblClickKey.Text = 'Auto-click hotkey (e.g. F8):'
+$lblClickKey.SetBounds(15, 302, 180, 20)
+$form.Controls.Add($lblClickKey)
+
+$txtClickKey = New-Object System.Windows.Forms.TextBox
+$txtClickKey.SetBounds(200, 299, 85, 24)
+$txtClickKey.Text = $cfg.ClickHotkey
+$form.Controls.Add($txtClickKey)
+
 $btnApply = New-Object System.Windows.Forms.Button
 $btnApply.Text = 'Save'
-$btnApply.SetBounds(120, 210, 80, 28)
+$btnApply.SetBounds(120, 327, 80, 28)
 $form.Controls.Add($btnApply)
 
 $btnHide = New-Object System.Windows.Forms.Button
 $btnHide.Text = 'Hide'
-$btnHide.SetBounds(205, 210, 80, 28)
+$btnHide.SetBounds(205, 327, 80, 28)
 $btnHide.add_Click({ $form.Hide() })
 $form.Controls.Add($btnHide)
 
@@ -244,6 +375,17 @@ $btnApply.add_Click({
         [System.Windows.Forms.MessageBox]::Show("Could not use hotkey '$($cfg.Hotkey)' (invalid or taken by another app). Keeping '$oldKey'.", 'HoverSwitch') | Out-Null
         $cfg.Hotkey = $oldKey; $txtKey.Text = $oldKey
         Register-AppHotkey | Out-Null
+    }
+    $cfg.ClickInterval = [int]$numInterval.Value
+    $oldClickKey = $cfg.ClickHotkey
+    $cfg.ClickHotkey = $txtClickKey.Text.Trim()
+    if (-not (Register-ClickHotkey)) {
+        [System.Windows.Forms.MessageBox]::Show("Could not use auto-click hotkey '$($cfg.ClickHotkey)' (invalid or taken by another app). Keeping '$oldClickKey'.", 'HoverSwitch') | Out-Null
+        $cfg.ClickHotkey = $oldClickKey; $txtClickKey.Text = $oldClickKey
+        Register-ClickHotkey | Out-Null
+    }
+    if ($script:clickerOn -and $script:nextClick -gt [DateTime]::Now.AddSeconds([int]$cfg.ClickInterval)) {
+        $script:nextClick = [DateTime]::Now.AddSeconds([int]$cfg.ClickInterval)
     }
     Save-Settings
     # re-apply the current mode so the new delay takes effect right away
@@ -290,6 +432,10 @@ $miRaise.add_Click({
 })
 $menu.Items.Add($miRaise) | Out-Null
 
+$miClicker = New-Object System.Windows.Forms.ToolStripMenuItem 'Auto-click'
+$miClicker.add_Click({ Switch-Clicker })
+$menu.Items.Add($miClicker) | Out-Null
+
 $miSettings = $menu.Items.Add('Settings...')
 $miSettings.add_Click({ Show-Settings })
 
@@ -330,6 +476,8 @@ function Show-Settings {
     $numNormal.Value = [decimal]$cfg.NormalDelay
     $chkRaise.Checked = [bool]$cfg.RaiseWindow
     $txtKey.Text = $cfg.Hotkey
+    $numInterval.Value = [decimal][Math]::Max(5, [int]$cfg.ClickInterval)
+    $txtClickKey.Text = $cfg.ClickHotkey
     Update-UI
     $form.Show(); $form.WindowState = 'Normal'; $form.Activate()
 }
@@ -339,8 +487,9 @@ function Update-UI {
     $delay = [HoverNative]::GetDelay()
     $state = if ($on) { "ON ($delay ms)" } else { 'OFF' }
     $hk = if ($cfg.Hotkey -and $cfg.Hotkey -ne 'None') { " - $($cfg.Hotkey)" } else { '' }
-    $tray.Icon = if ($on) { $iconOn } else { $iconOff }
+    $tray.Icon = if ($script:clickerOn) { if ($on) { $iconOnClick } else { $iconOffClick } } else { if ($on) { $iconOn } else { $iconOff } }
     $tip = "HoverSwitch: $state$hk"
+    if ($script:clickerOn) { $tip = "Hover $state | Auto-click: $(Get-ClickerStatus)" }
     if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
     $tray.Text = $tip   # tooltip, max 63 chars
     $miToggle.Text = if ($on) { 'Turn OFF' } else { "Turn ON ($($cfg.HoverDelay) ms)" }
@@ -348,11 +497,23 @@ function Update-UI {
     foreach ($i in $miDelay.DropDownItems) { $i.Checked = ([int]$i.Tag -eq [int]$cfg.HoverDelay) }
     $btnToggle.Text = if ($on) { "ON - $delay ms   (click to turn off)" } else { 'OFF   (click to turn on)' }
     $btnToggle.BackColor = if ($on) { [System.Drawing.Color]::FromArgb(46, 170, 80) } else { [System.Drawing.Color]::FromArgb(120, 120, 120) }
+    $ck = if ($cfg.ClickHotkey -and $cfg.ClickHotkey -ne 'None') { ", $($cfg.ClickHotkey)" } else { '' }
+    $miClicker.Checked = $script:clickerOn
+    $miClicker.Text = if ($script:clickerOn) { "Auto-click ON - $(Get-ClickerStatus) (stop$ck)" } else { "Auto-click every $(Format-Interval) in WoW$ck" }
+    if ($script:clickerOn) {
+        $btnClicker.Text = "AUTO-CLICK ON - $(Get-ClickerStatus)  ($script:clickCount)"
+        $btnClicker.BackColor = [System.Drawing.Color]::FromArgb(230, 120, 0)
+    } else {
+        $btnClicker.Text = "Auto-click OFF   (click to start$ck)"
+        $btnClicker.BackColor = [System.Drawing.Color]::FromArgb(120, 120, 120)
+    }
     $form.Icon = $tray.Icon
 }
 
 function Exit-App {
     $tray.Visible = $false
+    $clickTimer.Stop()
+    $clickHotkey.Dispose()
     $hotkey.Dispose()
     $tray.Dispose()
     [System.Windows.Forms.Application]::Exit()
@@ -362,6 +523,10 @@ function Exit-App {
 if (-not (Register-AppHotkey)) {
     $tray.Visible = $true
     $tray.ShowBalloonTip(4000, 'HoverSwitch', "Hotkey '$($cfg.Hotkey)' is taken by another app. Change it in Settings.", 'Warning')
+}
+if (-not (Register-ClickHotkey)) {
+    $tray.Visible = $true
+    $tray.ShowBalloonTip(4000, 'HoverSwitch', "Auto-click hotkey '$($cfg.ClickHotkey)' is taken by another app. Change it in Settings.", 'Warning')
 }
 Update-UI
 $tray.Visible = $true

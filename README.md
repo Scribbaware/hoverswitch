@@ -25,6 +25,17 @@ All versions are on the [Releases page](https://github.com/Scribbaware/hoverswit
 - **Double-click** or Settings...: set any delay, the "normal" delay for OFF, the hotkey, and whether the hovered window also jumps to the front.
 - "Turn OFF and exit" restores normal behaviour; "Exit (leave as is)" keeps the current state.
 
+## Auto-click (WoW only)
+Made for creating a character on a full realm, where **Finish** keeps failing on the population limit. Hover the mouse over the Finish button and let HoverSwitch retry it for you.
+
+- **F8** (or right-click > **Auto-click**): start/stop. It clicks once right away, then every 2 minutes.
+- It only clicks while a WoW window (`WowClassic.exe`, `Wow.exe`, ...) is in the foreground. If a click is due while you are in another window, it waits and clicks as soon as WoW is in front again.
+- It clicks wherever the mouse is at that moment, so leave the mouse on the button.
+- While it runs, the tray icon gets an **orange dot**, and the tooltip / menu show "next in 1:23" or "waiting for WoW". You get a balloon when it starts and stops.
+- Settings: the interval (seconds) and the hotkey (`F8`, `Ctrl+F8`, `None`, ...). Note that HoverSwitch takes the hotkey for itself, so F8 no longer reaches WoW or other apps while HoverSwitch runs. Pick another key if you use F8.
+
+Heads-up: Blizzard's rules forbid automating input in the game, so use this at your own risk.
+
 Settings are stored in `%APPDATA%\HoverSwitch\settings.json`. On first run the current Windows delay is saved as your "normal" delay.
 
 ## How it works
