@@ -31,9 +31,10 @@ Made for creating a character on a full realm, where **Finish** keeps failing on
 - **F8** (or right-click > **Auto-click**): start/stop. It clicks once right away, then every 2 minutes.
 - It only clicks while a WoW window (`WowClassic.exe`, `Wow.exe`, ...) is in the foreground. If a click is due while you are in another window, it waits and clicks as soon as WoW is in front again.
 - It clicks wherever the mouse is at that moment, so leave the mouse on the button.
-- 3 seconds after each click it presses **Enter**, which closes the "This faction is currently unavailable ... population imbalance" dialog so the next try can start. Set the delay (or 0 to turn it off) in Settings. If the character does get created, that Enter lands on the character list and may log the new character in.
+- 3 seconds after each click it presses **Enter**, which closes the "This faction is currently unavailable ... population imbalance" dialog so the next try can start. Set the delay (or 0 to turn it off) in Settings.
+- **Stops by itself on success.** Just before each click it takes a tiny snapshot of the screen under the mouse. When a try fails, the dialog appears in the middle but the Finish button under the mouse looks the same, so it presses Enter. When a try succeeds, WoW switches to the character list and that spot changes, so it does **not** press Enter: it stops, plays a sound and shows a balloon. If you moved the mouse in between, it just presses Enter as usual. You can turn this check off in Settings.
 - While it runs, the tray icon gets an **orange dot**, and the tooltip / menu show "next in 1:23" or "waiting for WoW". You get a balloon when it starts and stops.
-- Settings: the interval (seconds), the Enter delay and the hotkey (`F8`, `Ctrl+F8`, `None`, ...). Note that HoverSwitch takes the hotkey for itself, so F8 no longer reaches WoW or other apps while HoverSwitch runs. Pick another key if you use F8.
+- Settings: the interval (seconds), the Enter delay, the stop-on-change check and the hotkey (`F8`, `Ctrl+F8`, `None`, ...). Note that HoverSwitch takes the hotkey for itself, so F8 no longer reaches WoW or other apps while HoverSwitch runs. Pick another key if you use F8.
 
 Heads-up: Blizzard's rules forbid automating input in the game, so use this at your own risk.
 

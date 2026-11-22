@@ -11,8 +11,9 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
 using System;
+using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -64,6 +65,37 @@ public static class HoverNative {
         System.Threading.Thread.Sleep(60);
         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
     }
+    // Small screenshot around the mouse (60x30 px, every 3rd pixel), or null if it fails.
+    public static int[] SnapAroundCursor() {
+        try {
+            Point p = Cursor.Position;
+            const int w = 60, h = 30;
+            using (Bitmap bmp = new Bitmap(w, h))
+            using (Graphics g = Graphics.FromImage(bmp)) {
+                g.CopyFromScreen(p.X - w / 2, p.Y - h / 2, 0, 0, new Size(w, h));
+                int[] px = new int[(w / 3) * (h / 3)];
+                int i = 0;
+                for (int y = 0; y + 3 <= h; y += 3)
+                    for (int x = 0; x + 3 <= w; x += 3)
+                        px[i++] = bmp.GetPixel(x, y).ToArgb();
+                return px;
+            }
+        } catch { return null; }
+    }
+    // Average colour difference (0-255) between two snaps; -1 if they can't be compared.
+    public static double SnapDiff(int[] a, int[] b) {
+        if (a == null || b == null || a.Length != b.Length) return -1;
+        long sum = 0;
+        for (int i = 0; i < a.Length; i++) {
+            int x = a[i], y = b[i];
+            sum += Math.Abs(((x >> 16) & 255) - ((y >> 16) & 255))
+                 + Math.Abs(((x >> 8) & 255) - ((y >> 8) & 255))
+                 + Math.Abs((x & 255) - (y & 255));
+        }
+        return sum / (3.0 * a.Length);
+    }
+    public static Point CursorPos() { return Cursor.Position; }
+
     // One Enter key press.
     public static void PressEnter() {
         byte scan = (byte)MapVirtualKey(0x0D, 0);
@@ -126,6 +158,7 @@ $defaults = [ordered]@{
     ClickHotkey   = 'F8'   # starts/stops auto-click
     ClickInterval = 120    # seconds between auto-clicks
     EnterDelay    = 3      # seconds after each click to press Enter (0 = no Enter)
+    StopOnChange  = $true  # stop (no Enter) when the screen under the mouse changed after a click = character created
 }
 $cfg = [ordered]@{}
 foreach ($k in $defaults.Keys) { $cfg[$k] = $defaults[$k] }
@@ -222,6 +255,8 @@ function Register-ClickHotkey { Register-Key $clickHotkey $cfg.ClickHotkey }
 $script:clickerOn = $false
 $script:nextClick = [DateTime]::MinValue
 $script:pendingEnter = $null   # time to press Enter after the last click
+$script:clickSnap = $null      # what the screen under the mouse looked like just before the last click
+$script:clickPos = $null
 $script:clickCount = 0
 $script:wowInFront = $false
 
@@ -261,10 +296,21 @@ function Invoke-ClickerTick {
     $now = [DateTime]::Now
     if ($null -ne $script:pendingEnter -and $now -ge $script:pendingEnter) {
         # Close the "faction unavailable" dialog. Skipped if WoW is no longer in front.
-        if ($script:wowInFront) { [HoverNative]::PressEnter() }
         $script:pendingEnter = $null
+        if ($script:wowInFront) {
+            if (Test-ScreenChanged) {
+                # The Finish button is gone (no failure dialog, we're on the character list): success.
+                [System.Media.SystemSounds]::Exclamation.Play()
+                Set-Clicker $false
+                $tray.ShowBalloonTip(10000, 'HoverSwitch', 'The screen under the mouse changed after the click: character created? Auto-click stopped (no Enter pressed).', 'Warning')
+                return
+            }
+            [HoverNative]::PressEnter()
+        }
     }
     if ($script:wowInFront -and $null -eq $script:pendingEnter -and $now -ge $script:nextClick) {
+        $script:clickSnap = [HoverNative]::SnapAroundCursor()
+        $script:clickPos = [HoverNative]::CursorPos()
         [HoverNative]::LeftClick()
         $script:clickCount++
         $script:nextClick = $now.AddSeconds([Math]::Max(5, [int]$cfg.ClickInterval))
@@ -276,6 +322,17 @@ function Invoke-ClickerTick {
 $clickTimer = New-Object System.Windows.Forms.Timer
 $clickTimer.Interval = 1000
 $clickTimer.add_Tick({ Invoke-ClickerTick })
+
+# After a failed Finish, WoW shows a dialog in the middle of the screen, but the Finish button under
+# the mouse looks the same. After a successful one, WoW switches to the character list, so the spot
+# under the mouse changes. If the mouse was moved or the screen can't be read, assume no change.
+function Test-ScreenChanged {
+    if (-not [bool]$cfg.StopOnChange -or $null -eq $script:clickPos) { return $false }
+    $pos = [HoverNative]::CursorPos()
+    if ([Math]::Abs($pos.X - $script:clickPos.X) -gt 3 -or [Math]::Abs($pos.Y - $script:clickPos.Y) -gt 3) { return $false }
+    $diff = [HoverNative]::SnapDiff($script:clickSnap, [HoverNative]::SnapAroundCursor())
+    return ($diff -gt 25)
+}
 
 function Get-ClickerStatus {
     if (-not $script:clickerOn) { return 'OFF' }
@@ -292,7 +349,7 @@ $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
 $form.StartPosition = 'CenterScreen'
-$form.ClientSize = New-Object System.Drawing.Size 300, 397
+$form.ClientSize = New-Object System.Drawing.Size 300, 425
 $form.Icon = $iconOn
 $form.Font = New-Object System.Drawing.Font 'Segoe UI', 9
 
@@ -377,24 +434,30 @@ $numEnter.Minimum = 0; $numEnter.Maximum = 60
 $numEnter.Value = [decimal][Math]::Min(60, [Math]::Max(0, [int]$cfg.EnterDelay))
 $form.Controls.Add($numEnter)
 
+$chkStop = New-Object System.Windows.Forms.CheckBox
+$chkStop.Text = 'Stop instead of Enter when the screen changed'
+$chkStop.SetBounds(15, 328, 275, 22)
+$chkStop.Checked = [bool]$cfg.StopOnChange
+$form.Controls.Add($chkStop)
+
 $lblClickKey = New-Object System.Windows.Forms.Label
 $lblClickKey.Text = 'Auto-click hotkey (e.g. F8):'
-$lblClickKey.SetBounds(15, 334, 180, 20)
+$lblClickKey.SetBounds(15, 362, 180, 20)
 $form.Controls.Add($lblClickKey)
 
 $txtClickKey = New-Object System.Windows.Forms.TextBox
-$txtClickKey.SetBounds(200, 331, 85, 24)
+$txtClickKey.SetBounds(200, 359, 85, 24)
 $txtClickKey.Text = $cfg.ClickHotkey
 $form.Controls.Add($txtClickKey)
 
 $btnApply = New-Object System.Windows.Forms.Button
 $btnApply.Text = 'Save'
-$btnApply.SetBounds(120, 361, 80, 28)
+$btnApply.SetBounds(120, 389, 80, 28)
 $form.Controls.Add($btnApply)
 
 $btnHide = New-Object System.Windows.Forms.Button
 $btnHide.Text = 'Hide'
-$btnHide.SetBounds(205, 361, 80, 28)
+$btnHide.SetBounds(205, 389, 80, 28)
 $btnHide.add_Click({ $form.Hide() })
 $form.Controls.Add($btnHide)
 
@@ -411,6 +474,7 @@ $btnApply.add_Click({
     }
     $cfg.ClickInterval = [int]$numInterval.Value
     $cfg.EnterDelay = [int]$numEnter.Value
+    $cfg.StopOnChange = $chkStop.Checked
     $oldClickKey = $cfg.ClickHotkey
     $cfg.ClickHotkey = $txtClickKey.Text.Trim()
     if (-not (Register-ClickHotkey)) {
@@ -513,6 +577,7 @@ function Show-Settings {
     $numInterval.Value = [decimal][Math]::Max(5, [int]$cfg.ClickInterval)
     $txtClickKey.Text = $cfg.ClickHotkey
     $numEnter.Value = [decimal][Math]::Min(60, [Math]::Max(0, [int]$cfg.EnterDelay))
+    $chkStop.Checked = [bool]$cfg.StopOnChange
     Update-UI
     $form.Show(); $form.WindowState = 'Normal'; $form.Activate()
 }
